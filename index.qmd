@@ -56,7 +56,7 @@ Pkg.instantiate()
 
 using CEVE543Utils
 using CairoMakie, CSV, DataFrames, Dates, Distributions, LaTeXStrings
-using Printf, Random, Statistics
+using Printf, Random, Statistics,Turing
 using FlexiChains: summarystats
 
 rng = MersenneTwister(543)
@@ -71,7 +71,7 @@ The file `hobby-daily.csv` has one row for each day with a valid reading, in mil
 
 @fig-daily plots every wet day.
 
-```{julia}
+<!-- ```{julia}
 #| solution: false
 #| label: fig-daily
 #| fig-cap: "Daily rainfall at Houston Hobby Airport, wet days only."
@@ -83,34 +83,11 @@ fig = Figure(; size=(700, 300))
 ax = Axis(fig[1, 1]; xlabel=L"\text{date}", ylabel=L"\text{daily rainfall (mm)}")
 scatter!(ax, wet.date, wet.prcp_mm; color=colors[1], markersize=3)
 fig
-```
+``` -->
 
 Not every year is complete.
 @fig-days-per-year counts the days with a valid reading in each year.
 
-```{julia}
-#| solution: false
-#| label: fig-days-per-year
-#| fig-cap: "Days with a valid reading in each year at Houston Hobby Airport."
-days_per_year = combine(groupby(daily, :year), nrow => :n_days)
-fig = Figure(; size=(700, 300))
-ax = Axis(fig[1, 1]; xlabel=L"\text{year}", ylabel=L"\text{days with a valid reading}")
-scatterlines!(ax, days_per_year.year, days_per_year.n_days; color=colors[1], markersize=5)
-fig
-```
-
-Many years are missing days, and 2026 is not over yet, so you need to decide how to handle the gaps.
-Assume the data are *missing at random*: whether a day was recorded has nothing to do with how much rain fell.
-To see when this might fail, picture a rain gauge that breaks in the heaviest storms.
-A simple approach is to keep only the years with at least some number of valid days, such as 350.
-You are welcome to try other cutoffs or other ways to filter.
-
-```{julia}
-#| solution: false
-#| output: false
-keep = days_per_year.year[(days_per_year.n_days .>= 350) .& (days_per_year.year .<= 2025)]
-filter!(r -> r.year in keep, daily)
-```
 
 ### Covariates
 
@@ -125,7 +102,7 @@ The file `covariates.csv` has three candidate covariates, one row per year from 
 CO2 and global temperature both rise over the record, so they are candidates for a long-term trend.
 Niño 3.4 measures the El Niño-Southern Oscillation, which shifts from year to year with no long-term trend, so it is a candidate for explaining which years are wet.
 
-```{julia}
+<!-- ```{julia}
 #| solution: false
 #| label: fig-covariates
 #| fig-cap: "The three candidate covariates over the years of the Hobby record."
@@ -135,7 +112,127 @@ for (k, (col, label)) in enumerate(((:log_CO2, "log CO2"), (:gmst, "GMST anomaly
     lines!(Axis(fig[k, 1]; ylabel=label, xlabel=k == 3 ? "year" : ""), covariates.year, covariates[!, col]; color=colors[k])
 end
 fig
-```
+``` -->
+
+<!-- ```{julia}
+# Diagnose stationary GPD parameters across candidate thresholds.
+function gpd_threshold_plot(
+    peaks;
+    lo_quantile=0.0,
+    hi_quantile=0.99,
+    n_thresholds=60,
+    min_events=30
+)
+    # Accept either a peak table or a rainfall vector.
+    values = peaks isa AbstractDataFrame ?
+        peaks.prcp_mm : peaks
+
+    rain = Float64.(collect(skipmissing(values)))
+    rain = filter(v -> isfinite(v) && v > 0, rain)
+
+    isempty(rain) && error("No valid positive peaks.")
+    0 <= lo_quantile < hi_quantile <= 1 ||
+        error("Invalid quantile range.")
+
+    thresholds = collect(range(
+        quantile(rain, lo_quantile),
+        quantile(rain, hi_quantile);
+        length=n_thresholds
+    ))
+
+    results = DataFrame(
+        threshold_mm=Float64[],
+        n_events=Int[],
+        location_mm=Float64[],
+        scale_mm=Float64[],
+        shape=Float64[],
+        modified_scale_mm=Float64[]
+    )
+
+    failures = DataFrame(
+        threshold_mm=Float64[],
+        message=String[]
+    )
+
+    for u in thresholds
+        selected = rain[rain .> u]
+        length(selected) < min_events && continue
+
+        try
+            fit = gpfit(selected, u)
+            raw = getdistribution(fit)
+            distribution = raw isa Distribution ? raw : first(raw)
+
+            _, scale, shape = Distributions.params(distribution)
+
+            if !(isfinite(scale) && scale > 0 && isfinite(shape))
+                error("Invalid fitted parameters.")
+            end
+
+            push!(results, (
+                u,
+                length(selected),
+                u,
+                scale,
+                shape,
+                scale - shape * u
+            ))
+        catch err
+            push!(failures, (u, sprint(showerror, err)))
+        end
+    end
+
+    isempty(results) && error("No successful threshold fits.")
+
+    fig = Figure(size=(1100, 700), backgroundcolor=:white)
+
+    panels = [
+        (:location_mm, "Location = threshold (mm)", "#999999"),
+        (:scale_mm, "Scale σᵤ (mm)", "#168C91"),
+        (:shape, "Shape ξ", "#8056A3"),
+        (:modified_scale_mm, "Modified scale σᵤ − ξu (mm)", "#D88934")
+    ]
+
+    for (k, (column, ylabel, color)) in enumerate(panels)
+        row = cld(k, 2)
+        col = mod1(k, 2)
+
+        ax = Axis(
+            fig[row, col];
+            xlabel="Threshold u (mm)",
+            ylabel=ylabel,
+            xgridvisible=false,
+            ygridcolor=(:gray, 0.15)
+        )
+
+        scatterlines!(
+            ax,
+            results.threshold_mm,
+            results[!, column];
+            color=color,
+            linewidth=2,
+            markersize=4
+        )
+
+        hidespines!(ax, :t, :r)
+    end
+
+    return (
+        figure=fig,
+        estimates=results,
+        failures=failures
+    )
+end
+
+# Use the retained peaks from 72-hour declustering.
+threshold_check = gpd_threshold_plot(
+    peaks72;
+    lo_quantile=0.0,
+    hi_quantile=0.99
+)
+
+threshold_check.figure
+``` -->
 
 ## Your Challenge
 
@@ -188,7 +285,7 @@ $$
 For simplicity, the covariate is the year centered on 1985, $x_t = t - 1985$.
 The synthetic dataset has one annual maximum for each year from 1946 to 2025.
 In 1985 its location rises by 0.5 mm per year and its scale grows by 0.4% per year, and both rates speed up slowly over time.
-
+<!-- 
 ```{julia}
 #| solution: false
 #| output: false
@@ -197,16 +294,16 @@ x = years .- 1985
 μ_true = 90 .+ 0.5 .* x .- 0.05 .* x .^ 2
 σ_true = 35 .* exp.(-0.005 .* x .+ 0.0005 .* x .^ 2)
 y_syn = rand.(rng, GeneralizedExtremeValue.(μ_true, σ_true, 0.15))
-```
+``` -->
 
 The `gevfitbayes` function from the `CEVE543Utils` package fits a GEV whose location and log scale are each a linear combination of the covariates you pass.
 Passing $x_t$ and $x_t^2$ as two covariates gives the quadratic above:
 
-```{julia}
+<!-- ```{julia}
 #| solution: false
 gev_syn = gevfitbayes(y_syn; locationcov=[x, x .^ 2], logscalecov=[x, x .^ 2], rng=rng, progress=false)
 DataFrame(summarystats(gev_syn.estimate))
-```
+``` -->
 
 where
 
@@ -228,7 +325,7 @@ It gives one row per posterior draw for each parameter.
 The first column is the intercept, which is the value at the means of the covariates rather than at $x_t = 0$.
 The second column is $\alpha_1$, the slope per year in 1985, and the third is $\alpha_2$.
 
-```{julia}
+<!-- ```{julia}
 #| solution: false
 coefs = params(gev_syn)
 α1 = coefs.β_location[:, 2]
@@ -253,14 +350,14 @@ for (T, rl) in ((10, rl10), (100, rl100))
     show_interval("$T-year change, 1986 to 2026", rl[:, 2] .- rl[:, 1])
     show_interval("$T-year change, 2026 to 2066", rl[:, 3] .- rl[:, 2])
 end
-```
+``` -->
 
 The projection to 2066 assumes the quadratic keeps going for another 40 years, past the end of the data.
 With log CO2 or GMST as the covariate, you would need a value for that covariate in 2066, which is an assumption about the future that you have to state and defend.
 
 @fig-syn-trend plots the fitted 2- and 100-year levels in each year of the record next to the true levels the synthetic data came from.
 
-```{julia}
+<!-- ```{julia}
 #| solution: false
 #| label: fig-syn-trend
 #| fig-cap: "The 2- and 100-year levels through time from the GEV fit to the synthetic record (posterior median), the true levels, and the synthetic annual maxima."
@@ -277,14 +374,15 @@ end
 scatter!(ax, years, y_syn; color=:black, markersize=5, label="synthetic annual maxima")
 axislegend(ax; position=:lt)
 fig
-```
+``` -->
+
 
 If you don't want to use a Bayesian approach, you can instead fit by maximum likelihood and use bootstrapping or another approach to characterize your uncertainty.
 `gevfit` fits the same model by maximum likelihood, and `getdistribution` gives the fitted GEV for each year.
 A parametric bootstrap draws a new record from those distributions, refits it, and records its return levels, many times over.
 The spread of the refitted levels is the uncertainty.
 
-```{julia}
+<!-- ```{julia}
 #| solution: false
 gev_mle = gevfit(y_syn; locationcov=[x, x .^ 2], logscalecov=[x, x .^ 2])
 gev_by_year = getdistribution(gev_mle)
@@ -304,7 +402,7 @@ for (T, rl) in ((10, rl10_boot), (100, rl100_boot))
     show_interval("$T-year change, 1986 to 2026", rl[:, 2] .- rl[:, 1])
     show_interval("$T-year change, 2026 to 2066", rl[:, 3] .- rl[:, 2])
 end
-```
+``` -->
 
 ### Other functional forms
 
@@ -331,7 +429,8 @@ A `logscale` slope is a proportional change in the scale, so `logscale=Normal(0,
 `quantile_priors` states what you believe about return levels, as in lab 4.
 Each belief names an observation, a return period, and a distribution for that return level in the year of the observation, and you can give as many as you like.
 
-```{julia}
+
+<!-- ```{julia}
 #| solution: false
 beliefs = [
     (index=1, period=100, belief=Normal(250, 40)),
@@ -340,19 +439,19 @@ beliefs = [
 gev_beliefs = gevfitbayes(y_syn; locationcov=[x, x .^ 2], logscalecov=[x, x .^ 2], quantile_priors=beliefs, rng=rng, progress=false)
 rl100_beliefs = returnlevel(gev_beliefs, 100; locationcov=[[2026 - 1985], [(2026 - 1985)^2]], logscalecov=[[2026 - 1985], [(2026 - 1985)^2]])
 @printf("2026 100-year level: median %.0f mm without beliefs, %.0f mm with them\n", median(rl100[:, 2]), median(rl100_beliefs))
-```
+```  -->
 
 ### GPD Example
 
 The second example is a GPD with a trend in the log scale, using the same centered year as the covariate.
 The synthetic storm record has 12 storms a year above a threshold of 25.4 mm, and the scale of each storm's excess grows by 0.4% per year.
 
-```{julia}
+<!-- ```{julia}
 #| solution: false
 #| output: false
 x_storm = repeat(x; inner=12)
 peaks_syn = 25.4 .+ rand.(rng, GeneralizedPareto.(0, 20 .* exp.(0.004 .* x_storm), 0.15))
-```
+``` 
 
 `gpfitbayes` takes the peaks and the threshold $u$, and fits a GPD to the excesses with the log scale a straight line in the covariate, where $x_i$ is the year of storm $i$ minus 1985:
 
@@ -360,11 +459,11 @@ $$
 y_i - u \sim \text{GPD}\left(\exp(\beta_0 + \beta_1 x_i), \; \xi\right).
 $$
 
-```{julia}
+<!-- ```{julia}
 #| solution: false
 gp_syn = gpfitbayes(peaks_syn, 25.4; logscalecov=[x_storm], rng=rng, progress=false)
 DataFrame(summarystats(gp_syn.estimate))
-```
+``` 
 
 A GPD return level also needs `rate`, the average number of storms per year above the threshold, which is 12 here.
 A GPD has no location parameter to trend, so you pass only `logscalecov`.
@@ -372,7 +471,7 @@ A GPD has no location parameter to trend, so you pass only `logscalecov`.
 They do not allow a trend in how often storms exceed the threshold, and their return-level intervals leave out the uncertainty in it.
 If you want to model either, write the model in Turing directly.
 
-```{julia}
+<!-- ```{julia}
 #| solution: false
 rl10_gp = returnlevel(gp_syn, 10; rate=12, logscalecov=[x_report])
 rl100_gp = returnlevel(gp_syn, 100; rate=12, logscalecov=[x_report])
@@ -380,7 +479,7 @@ for (T, rl) in ((10, rl10_gp), (100, rl100_gp))
     show_interval("$T-year level in 2026", rl[:, 2])
     show_interval("$T-year change, 1986 to 2026", rl[:, 2] .- rl[:, 1])
 end
-```
+``` -->
 
 With 960 storms in place of 80 annual maxima, the intervals are narrower.
 
@@ -389,11 +488,810 @@ With 960 storms in place of 80 annual maxima, the intervals are narrower.
 Now use the code in the examples to answer the key questions above.
 If you fit a GEV, this cell makes a table of annual maxima joined to the covariates:
 
+
+
+1. Return levels in 2026
+
+The estimated 10-year return level is about 195 mm, and the 100-year return level is about 342 mm.
+2. Uncertainty
+The 95% credible intervals are approximately 173–233 mm and 265–522 mm, respectively. The 100-year estimate is more uncertain because it describes a rarer event.
+3. Changes over the past 40 years
+My stationary model estimates no change. The tests found no significant trend, but this does not prove that no change occurred.
+4. Changes over the next 40 years
+The model projects no change if the climate and physical processes driving extreme rainfall remain similar.
+5. Why GPD?
+I used GPD because it includes multiple extreme events per year, rather than only the annual maximum. I kept years with at least 350 valid days.
+6. Threshold selection
+I chose 57.2 mm, the 99th percentile. The mean excess plot was roughly linear near this threshold. Parameter stability plots provided additional threshold diagnostics.
+7. Declustering
+I grouped consecutive exceedances separated by 72 hours or less and kept the largest value in each group. This helps avoid counting the same storm more than once.
+8. Why stationary?
+The trend tests found no significant trends, so I considered a stationary model. These tests do not prove stationarity.
+9. Priors and uncertainty
+I used the Lab05 priors: $N(0,3^2)$ for log scale and $N(0,0.25^2)$ for shape. I calculated return levels from the posterior draws and used their 2.5th and 97.5th percentiles for the credible intervals. These intervals treat the event rate as fixed.
+### Setup and retained data
+
+
+
+```{julia}
+
+# Load the record because the earlier loading cell is commented out.
+daily = CSV.read(joinpath(here, "hobby-daily.csv"), DataFrame)
+
+@assert allunique(daily.date) "Duplicate dates must be resolved."
+
+# Keep valid daily rainfall observations through 2025.
+daily = filter(
+    r -> !ismissing(r.date) &&
+         !ismissing(r.prcp_mm) &&
+         isfinite(r.prcp_mm) &&
+         r.prcp_mm >= 0 &&
+         year(r.date) <= 2025,
+    daily
+)
+
+daily.year = year.(daily.date)
+
+# Preserve the full valid record for checking rainfall between peaks.
+daily_check = sort(copy(daily), :date)
+
+# Retain years with at least 350 valid observations.
+coverage = combine(
+    groupby(daily_check, :year),
+    nrow => :n_days
+)
+
+retained_years = sort(
+    coverage.year[coverage.n_days .>= 350]
+)
+
+@assert !isempty(retained_years) "No eligible years were found."
+
+daily = filter(r -> r.year in retained_years, daily_check)
+
+# Calculate the threshold using all observed days, including zeros.
+rain = Float64.(daily.prcp_mm)
+u99 = quantile(rain, 0.99)
+
+rainy_counts = [
+    count(r -> r.year == yr && r.prcp_mm > 0, eachrow(daily))
+    for yr in retained_years
+]
+
+@printf(
+    "Retained years: %d\nAverage observed rainy days per year: %.1f\n99th-percentile threshold: %.2f mm\n",
+    length(retained_years),
+    mean(rainy_counts),
+    u99
+)
+```
+
+
+### Mean excess plot
+
 ```{julia}
 #| solution: false
-#| output: false
-annmax = combine(groupby(daily, :year), :prcp_mm => maximum => :y)
-annmax = sort(innerjoin(annmax, covariates; on=:year), :year)
+
+thresholds = collect(0.0:1.0:180.0)
+min_exceedances = 20
+
+mean_excess = [
+    begin
+        excess = rain[rain .> u] .- u
+        length(excess) >= min_exceedances ? mean(excess) : NaN
+    end
+    for u in thresholds
+]
+
+fig = Figure(size=(1000, 280), backgroundcolor=:white)
+
+ax = Axis(
+    fig[1, 1];
+    xlabel="Threshold u (mm)",
+    ylabel="Mean excess (mm)",
+    xticks=0:30:180,
+    yticks=0:10:60,
+    xgridvisible=false,
+    ygridcolor=(:gray, 0.15)
+)
+
+lines!(
+    ax, thresholds, mean_excess;
+    color="#168C91",
+    linewidth=2.5
+)
+
+probs = [0.95, 0.96, 0.97, 0.98, 0.99]
+threshold_quantiles = quantile(rain, probs)
+
+line_colors = [
+    "#D4AE19",
+    "#84B547",
+    "#4477AA",
+    "#AA4499",
+    "#E68535"
+]
+
+for (p, u, color) in zip(probs, threshold_quantiles, line_colors)
+    vlines!(
+        ax, [u];
+        color=color,
+        linestyle=:dash,
+        linewidth=2,
+        label="$(round(Int, 100p))th percentile: $(round(u; digits=1)) mm"
+    )
+end
+
+xlims!(ax, 0, 180)
+ylims!(ax, 0, 60)
+axislegend(ax; position=:rb, labelsize=16)
+hidespines!(ax, :t, :r)
+
+fig
+```
+
+### Declustering and gap comparison
+
+```{julia}
+#| solution: false
+
+# Merge adjacent exceedances separated by at most the selected gap.
+# Retain the largest daily rainfall value in each cluster.
+function decluster_gap(exceedances, gap_hours)
+    ordered = sort(exceedances, :date)
+    isempty(ordered) && return copy(ordered)
+
+    selected = Int[]
+    best = 1
+
+    for i in 2:nrow(ordered)
+        separation_hours = 24 * Dates.value(
+            ordered.date[i] - ordered.date[i - 1]
+        )
+
+        if separation_hours > gap_hours
+            push!(selected, best)
+            best = i
+        elseif ordered.prcp_mm[i] > ordered.prcp_mm[best]
+            best = i
+        end
+    end
+
+    push!(selected, best)
+    return ordered[selected, :]
+end
+
+exceedances99 = filter(r -> r.prcp_mm > u99, daily)
+peaks72 = decluster_gap(exceedances99, 72)
+peaks72.excess_mm = peaks72.prcp_mm .- u99
+
+min_gap_hours = [24, 72, 168, 344]
+palette = ["black", "black", "black", "black"]
+
+# Use annual event counts for the gap-comparison figures.
+# Exposure-adjusted rates are calculated separately below.
+annual_lambda = DataFrame(
+    percentile=Int[],
+    threshold_mm=Float64[],
+    gap_hours=Int[],
+    year=Int[],
+    lambda_per_year=Float64[]
+)
+
+for gap_h in min_gap_hours
+    gap_peaks = decluster_gap(exceedances99, gap_h)
+
+    for yr in retained_years
+        n_events_year = count(==(yr), gap_peaks.year)
+
+        push!(annual_lambda, (
+            99,
+            u99,
+            gap_h,
+            yr,
+            Float64(n_events_year)
+        ))
+    end
+end
+
+@printf("Retained peaks with a 72-hour gap: %d\n", nrow(peaks72))
+
+results99 = filter(r -> r.percentile == 99, annual_lambda)
+ymax = 1.1 * maximum(results99.lambda_per_year) + 0.2
+
+fig = Figure(size=(1600, 380), backgroundcolor=:white)
+
+for (k, gap_h) in enumerate(min_gap_hours)
+    results = sort(
+        filter(r -> r.gap_hours == gap_h, results99),
+        :year
+    )
+
+    mean_lambda = mean(results.lambda_per_year)
+
+    local ax = Axis(
+        fig[1, k];
+        title="Gap: $gap_h h",
+        xlabel="Year",
+        ylabel=k == 1 ? "Events/year" : "",
+        xgridvisible=false,
+        ygridcolor=(:gray, 0.15),
+        titlesize=16
+    )
+
+    scatterlines!(
+        ax, results.year, results.lambda_per_year;
+        color=palette[k],
+        linewidth=1.8,
+        markersize=4
+    )
+
+    hlines!(
+        ax, [mean_lambda];
+        color=:gray40,
+        linestyle=:dash,
+        linewidth=1.5
+    )
+
+    text!(
+        ax, 0.97, 0.95;
+        text="Mean λ = $(round(mean_lambda; digits=2))",
+        space=:relative,
+        align=(:right, :top),
+        fontsize=18,
+        color=:gray25
+    )
+
+    ylims!(ax, 0, ymax)
+    hidespines!(ax, :t, :r)
+end
+
+fig
+```
+
+### Retained peaks
+
+```{julia}
+#| solution: false
+
+fig = Figure(size=(1100, 400), backgroundcolor=:white)
+
+ax = Axis(
+    fig[1, 1];
+    xlabel="Date",
+    ylabel="Daily rainfall (mm)",
+    xgridvisible=false,
+    ygridcolor=(:gray, 0.15)
+)
+
+scatter!(
+    ax, peaks72.date, peaks72.prcp_mm;
+    color="#168C91",
+    markersize=6,
+    label="Retained peaks"
+)
+
+hlines!(
+    ax, [u99];
+    color="#D88934",
+    linestyle=:dash,
+    linewidth=2,
+    label="99th-percentile threshold"
+)
+
+axislegend(ax; position=:rt, labelsize=16)
+hidespines!(ax, :t, :r)
+
+fig
+```
+
+### Rainfall between retained peaks
+
+```{julia}
+#| solution: false
+
+between_minima = DataFrame(
+    date1=Date[],
+    date2=Date[],
+    min_rain_mm=Union{Missing, Float64}[],
+    n_missing_days=Int[]
+)
+
+rain_by_date = Dict(
+    r.date => r.prcp_mm for r in eachrow(daily_check)
+)
+
+for i in 2:nrow(peaks72)
+    d1 = peaks72.date[i - 1]
+    d2 = peaks72.date[i]
+
+    between_dates = collect(
+        (d1 + Day(1)):Day(1):(d2 - Day(1))
+    )
+
+    observed = Float64[]
+    n_missing = 0
+
+    for d in between_dates
+        value = get(rain_by_date, d, missing)
+
+        if ismissing(value)
+            n_missing += 1
+        else
+            push!(observed, Float64(value))
+        end
+    end
+
+    minimum_rain = isempty(observed) ? missing : minimum(observed)
+
+    push!(between_minima, (
+        d1, d2, minimum_rain, n_missing
+    ))
+end
+
+has_minimum = .!ismissing.(between_minima.min_rain_mm)
+complete = has_minimum .& (between_minima.n_missing_days .== 0)
+incomplete = has_minimum .& (between_minima.n_missing_days .> 0)
+
+# Report how many intervals contain a recorded zero-rainfall day.
+n_zero_intervals = count(
+    v -> !ismissing(v) && v == 0,
+    between_minima.min_rain_mm
+)
+
+@printf(
+    "Intervals with a recorded zero-rainfall day: %d of %d\nIntervals containing missing days: %d\n",
+    n_zero_intervals,
+    nrow(between_minima),
+    count(>(0), between_minima.n_missing_days)
+)
+
+fig_min = Figure(size=(1100, 400), backgroundcolor=:white)
+
+ax_min = Axis(
+    fig_min[1, 1];
+    xlabel="Date of later retained peak",
+    ylabel="Minimum rainfall between peaks (mm)",
+    xgridvisible=false,
+    ygridcolor=(:gray, 0.15)
+)
+
+if any(complete)
+    scatter!(
+        ax_min,
+        between_minima.date2[complete],
+        Float64.(between_minima.min_rain_mm[complete]);
+        color="#168C91",
+        markersize=7,
+        label="Complete interval"
+    )
+end
+
+if any(incomplete)
+    scatter!(
+        ax_min,
+        between_minima.date2[incomplete],
+        Float64.(between_minima.min_rain_mm[incomplete]);
+        color="#D88934",
+        marker=:utriangle,
+        markersize=8,
+        label="Interval with missing days"
+    )
+end
+
+hlines!(ax_min, [0.0]; color=:gray40, linestyle=:dash)
+
+# Keep zero visible while allowing positive minima to be displayed.
+observed_minima = Float64.(collect(skipmissing(between_minima.min_rain_mm)))
+upper_limit = isempty(observed_minima) ? 1.0 :
+    max(1.0, 1.1 * maximum(observed_minima))
+ylims!(ax_min, -1, upper_limit)
+
+axislegend(ax_min; position=:rt, labelsize=14)
+hidespines!(ax_min, :t, :r)
+
+fig_min
+```
+
+### Trend assessment
+
+```{julia}
+#| solution: false
+
+annual_tests = combine(
+    groupby(daily, :year),
+    :prcp_mm => maximum => :max_mm,
+    :date => (d -> length(unique(d))) => :n_days
+)
+
+event_counts = combine(
+    groupby(peaks72, :year),
+    nrow => :n_events
+)
+
+annual_tests = leftjoin(annual_tests, event_counts; on=:year)
+annual_tests.n_events = Int.(coalesce.(annual_tests.n_events, 0))
+sort!(annual_tests, :year)
+
+annual_tests.exposure_years = [
+    r.n_days / Dates.daysinyear(Date(r.year, 1, 1))
+    for r in eachrow(annual_tests)
+]
+
+annual_tests.lambda = (
+    annual_tests.n_events ./ annual_tests.exposure_years
+)
+
+# Mann-Kendall test with tie and continuity corrections.
+function mk_test(response)
+    y = Float64.(response)
+    n = length(y)
+    n >= 3 || error("At least three observations are required.")
+
+    S = 0
+    for i in 1:(n - 1)
+        for j in (i + 1):n
+            S += sign(y[j] - y[i])
+        end
+    end
+
+    counts = Dict{Float64, Int}()
+    for value in y
+        counts[value] = get(counts, value, 0) + 1
+    end
+
+    tie_correction = sum(
+        t * (t - 1) * (2t + 5)
+        for t in values(counts)
+    )
+
+    var_S = (
+        n * (n - 1) * (2n + 5) - tie_correction
+    ) / 18
+
+    z = if var_S == 0 || S == 0
+        0.0
+    else
+        (S - sign(S)) / sqrt(var_S)
+    end
+
+    return (
+        tau=S / (n * (n - 1) / 2),
+        p_value=2 * ccdf(Normal(), abs(z))
+    )
+end
+
+# Ordinary linear regression slope test.
+function slope_test(years, response)
+    x = Float64.(years)
+    y = Float64.(response)
+    n = length(y)
+
+    n > 2 || error("At least three observations are required.")
+    length(x) == n || error("Input lengths must match.")
+
+    xc = x .- mean(x)
+    sxx = sum(abs2, xc)
+    sxx > 0 || error("Years must vary.")
+
+    slope = sum(xc .* (y .- mean(y))) / sxx
+    fitted = mean(y) .+ slope .* xc
+    residuals = y .- fitted
+
+    slope_se = sqrt(
+        sum(abs2, residuals) / (n - 2) / sxx
+    )
+
+    t_stat = if slope_se > 0
+        slope / slope_se
+    elseif slope == 0
+        0.0
+    else
+        sign(slope) * Inf
+    end
+
+    critical_t = quantile(TDist(n - 2), 0.975)
+
+    return (
+        slope=slope,
+        lower95=slope - critical_t * slope_se,
+        upper95=slope + critical_t * slope_se,
+        p_value=2 * ccdf(TDist(n - 2), abs(t_stat))
+    )
+end
+
+trend_results = DataFrame(
+    series=String[],
+    mk_tau=Float64[],
+    mk_p=Float64[],
+    slope=Float64[],
+    slope_lower95=Float64[],
+    slope_upper95=Float64[],
+    slope_p=Float64[]
+)
+
+for (label, response) in (
+    ("Annual maximum rainfall", annual_tests.max_mm),
+    ("Annual event rate", annual_tests.lambda)
+)
+    mk = mk_test(response)
+    reg = slope_test(annual_tests.year, response)
+
+    push!(trend_results, (
+        label,
+        mk.tau,
+        mk.p_value,
+        reg.slope,
+        reg.lower95,
+        reg.upper95,
+        reg.p_value
+    ))
+end
+
+trend_results
+```
+
+
+
+### Threshold stability
+
+```{julia}
+#| solution: false
+
+u_base = quantile(rain, 0.95)
+u_candidate = u99
+
+# Use a common set of peaks declustered at a lower base threshold.
+base_exceedances = sort(
+    filter(r -> r.prcp_mm > u_base, daily),
+    :date
+)
+
+base_peaks = decluster_gap(base_exceedances, 72)
+peak_values = Float64.(base_peaks.prcp_mm)
+
+@printf(
+    "Base threshold: %.1f mm\nCandidate threshold: %.1f mm\nEvents above candidate: %d\n",
+    u_base,
+    u_candidate,
+    count(v -> v > u_candidate, peak_values)
+)
+
+# Plot modified scale and shape with approximate confidence intervals.
+stability_plot(
+    peak_values;
+    lo_quantile=0.0,
+    hi_quantile=0.99
+)
+```
+
+### Bayesian stationary GPD
+
+```{julia}
+#| solution: false
+
+excess_final = Float64.(peaks72.prcp_mm .- u99)
+
+@assert all(excess_final .> 0)
+
+# Estimate the constant event rate using observed exposure.
+exposure_final = sum(annual_tests.exposure_years)
+rate_final = nrow(peaks72) / exposure_final
+λ = rate_final
+
+# Use only the Lab05 parameter priors.
+Turing.@model function gpd_lab5_prior(y)
+    logσ ~ Normal(0.0, 3.0)
+    ξ ~ Normal(0.0, 0.25)
+
+    σ := exp(logσ)
+
+    y .~ GPKernel(σ, ξ)
+end
+
+model_baseline = gpd_lab5_prior(excess_final)
+n_chains = 4
+
+initial_values = [
+    Turing.InitFromParams((
+        logσ=log(mean(excess_final)),
+        ξ=0.1
+    ))
+    for _ in 1:n_chains
+]
+
+chain_baseline = sample(
+    MersenneTwister(543),
+    model_baseline,
+    NUTS(0.99),
+    MCMCThreads(),
+    2000,
+    n_chains;
+    initial_params=initial_values,
+    progress=false
+)
+
+# Summarize diagnostics across all four chains.
+function check_chain(chain, label)
+    stats = DataFrame(summarystats(chain))
+
+    worst_rhat = maximum(skipmissing(stats.rhat))
+    smallest_bulk_ess = minimum(skipmissing(stats.ess_bulk))
+    smallest_tail_ess = minimum(skipmissing(stats.ess_tail))
+    divergences = count(!iszero, Array(chain[:numerical_error]))
+
+    @printf(
+        "%s: worst R̂ = %.3f, smallest bulk ESS = %.0f, smallest tail ESS = %.0f, divergences = %d\n",
+        label,
+        worst_rhat,
+        smallest_bulk_ess,
+        smallest_tail_ess,
+        divergences
+    )
+
+    return stats
+end
+
+stats_baseline = check_chain(chain_baseline, "GPD baseline")
+display(stats_baseline)
+```
+
+### Parameter estimates and return levels
+
+```{julia}
+#| solution: false
+
+# Use the fit created above instead of the undefined chains_compare.
+chain_lab05 = chain_baseline
+
+σ_draws = exp.(vec(Array(chain_lab05[:logσ])))
+ξ_draws = vec(Array(chain_lab05[:ξ]))
+
+u = u99
+
+@printf(
+    "Retained years: %d\nEvents: %d\nExposure: %.2f years\nλ: %.3f events/year\n",
+    length(retained_years),
+    nrow(peaks72),
+    exposure_final,
+    λ
+)
+
+parameter_results = DataFrame(
+    parameter=["Scale σ (mm)", "Shape ξ"],
+    median=[median(σ_draws), median(ξ_draws)],
+    lower95=[
+        quantile(σ_draws, 0.025),
+        quantile(ξ_draws, 0.025)
+    ],
+    upper95=[
+        quantile(σ_draws, 0.975),
+        quantile(ξ_draws, 0.975)
+    ]
+)
+
+# Define return periods by an expected annual exceedance rate of 1/T.
+function lab05_return_level(u, σ, ξ, λ, T)
+    a = log(λ * T)
+
+    if abs(ξ) < 1e-8
+        return u + σ * a
+    end
+
+    return u + σ * expm1(ξ * a) / ξ
+end
+
+return_results = DataFrame(
+    return_period_years=Int[],
+    median_mm=Float64[],
+    lower95_mm=Float64[],
+    upper95_mm=Float64[]
+)
+
+for T in (10, 100)
+    @assert λ * T > 1
+
+    rl_draws = lab05_return_level.(u, σ_draws, ξ_draws, λ, T)
+
+    push!(return_results, (
+        T,
+        median(rl_draws),
+        quantile(rl_draws, 0.025),
+        quantile(rl_draws, 0.975)
+    ))
+end
+
+display(parameter_results)
+display(return_results)
+
+for row in eachrow(return_results)
+    @printf(
+        "%d-year return level: %.1f mm [%.1f, %.1f], 95%% credible interval\n",
+        row.return_period_years,
+        row.median_mm,
+        row.lower95_mm,
+        row.upper95_mm
+    )
+end
+```
+
+### Repeat the four-chain fit
+
+```{julia}
+#| solution: false
+
+u_fit = u99
+y_fit = Float64.(peaks72.prcp_mm) .- u_fit
+
+@assert all(y_fit .> 0)
+@assert λ > 0
+
+# Use the same likelihood and priors as the first fit.
+Turing.@model function gpd_simple(y)
+    logσ ~ Normal(0, 3)
+    ξ ~ Normal(0, 0.25)
+
+    σ = exp(logσ)
+    y .~ GPKernel(σ, ξ)
+end
+
+rng_check = MersenneTwister(20261006)
+
+init_check = [
+    Turing.InitFromParams((
+        logσ=log(30.0),
+        ξ=0.05 + 0.05 * k
+    ))
+    for k in 1:4
+]
+
+chain_check = sample(
+    rng_check,
+    gpd_simple(y_fit),
+    NUTS(0.99),
+    MCMCThreads(),
+    2000,
+    4;
+    initial_params=init_check,
+    progress=false
+)
+
+gpd_diagnostics = check_chain(chain_check, "GPD repeat")
+display(gpd_diagnostics)
+
+σ_check = exp.(vec(Array(chain_check[:logσ])))
+ξ_check = vec(Array(chain_check[:ξ]))
+
+rl10_check = lab05_return_level.(
+    u_fit, σ_check, ξ_check, λ, 10
+)
+
+rl100_check = lab05_return_level.(
+    u_fit, σ_check, ξ_check, λ, 100
+)
+
+results_check = DataFrame(
+    quantity=String[],
+    median=Float64[],
+    lower95=Float64[],
+    upper95=Float64[]
+)
+
+for (label, draws) in (
+    ("Scale σ (mm)", σ_check),
+    ("Shape ξ", ξ_check),
+    ("10-year return level (mm)", rl10_check),
+    ("100-year return level (mm)", rl100_check)
+)
+    push!(results_check, (
+        label,
+        median(draws),
+        quantile(draws, 0.025),
+        quantile(draws, 0.975)
+    ))
+end
+
+display(results_check)
 ```
 
 ## Turning it in
